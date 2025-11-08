@@ -16,21 +16,21 @@ pipeline {
       steps {
         script {
           // Show what we have (never fail here)
-          sh '''
+          sh """
             echo "PWD=$(pwd)"
             echo "Scanning for Dockerfiles (non-fatal)…"
             (find backend -maxdepth 2 -type f -name Dockerfile 2>/dev/null || true) | sed 's|^./||'
             if [ -f frontend/Dockerfile ]; then echo "frontend/Dockerfile"; fi
-          '''
+          """
 
-          // Build up list without using 'set -e' so missing files don't kill the stage
+          // Build list safely (no 'set -e' so missing files don't kill the stage)
           def discovered = []
 
-          // frontend (optional)
-          def hasFrontend = sh(script: '[ -f frontend/Dockerfile ] && echo yes || echo no', returnStdout: true).trim() == 'yes'
-          if (hasFrontend) discovered << 'frontend'
+          // Optional frontend
+          def hasFrontend = sh(script: 'test -f frontend/Dockerfile && echo yes || echo no', returnStdout: true).trim() == 'yes'
+          if (hasFrontend) { discovered << 'frontend' }
 
-          // backend services (required at least one)
+          // Backend services that contain a Dockerfile
           def back = sh(
             script: '''
               if [ -d backend ]; then
@@ -41,7 +41,6 @@ pipeline {
             ''',
             returnStdout: true
           ).trim()
-
           if (back) {
             discovered.addAll(back.split("\\n").collect { it.trim() }.findAll { it })
           }
@@ -68,13 +67,13 @@ pipeline {
     stage('AWS login (ECR)') {
       steps {
         retry(2) {
-          sh '''
+          sh """
             set -e
-            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-            echo "$ACCOUNT_ID" > .account_id
-            aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-              | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-          '''
+            ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+            echo "\$ACCOUNT_ID" > .account_id
+            aws ecr get-login-password --region "${env.AWS_DEFAULT_REGION}" \
+              | docker login --username AWS --password-stdin "\$ACCOUNT_ID.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
+          """
         }
       }
     }
@@ -82,6 +81,7 @@ pipeline {
     stage('Build & Push (sequential)') {
       steps {
         script {
+          // helpers
           def toRepo = { name ->
             // frontend -> frontend ; helloService -> hello-service ; profileService -> profile-service
             name.replaceAll(/([a-z])([A-Z])/, '$1-$2').replaceAll(/[_\\s]+/, '-').toLowerCase()
@@ -103,3 +103,48 @@ pipeline {
                   exit 1
                 fi
               """
+
+              // Ensure ECR repo exists
+              sh """
+                set -e
+                aws ecr describe-repositories --repository-names "${repo}" >/dev/null 2>&1 || \
+                aws ecr create-repository --repository-name "${repo}" \
+                  --image-scanning-configuration scanOnPush=true \
+                  --encryption-configuration encryptionType=AES256
+              """
+
+              // Build
+              retry(2) {
+                sh """
+                  set -e
+                  echo "Building ${repo}:${env.IMAGE_TAG} from ${df} (context: ${ctx})"
+                  docker build -t "${repo}:${env.IMAGE_TAG}" -f "${df}" "${ctx}"
+                """
+              }
+
+              // Tag & push
+              retry(2) {
+                sh """
+                  set -e
+                  ACCOUNT_ID=\$(cat .account_id)
+                  REG="\${ACCOUNT_ID}.dkr.ecr.${env.AWS_DEFAULT_REGION}.amazonaws.com"
+                  docker tag "${repo}:${env.IMAGE_TAG}" "\${REG}/${repo}:${env.IMAGE_TAG}"
+                  docker tag "${repo}:${env.IMAGE_TAG}" "\${REG}/${repo}:latest"
+                  docker push "\${REG}/${repo}:${env.IMAGE_TAG}"
+                  docker push "\${REG}/${repo}:latest"
+                """
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'docker image prune -f || true'
+      sh 'rm -f .account_id || true'
+    }
+  }
+}
