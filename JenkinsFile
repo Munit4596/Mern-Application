@@ -15,23 +15,24 @@ pipeline {
     stage('Sanity & Discover services') {
       steps {
         script {
-          // List Dockerfiles (for visibility)
+          // Show what we have (never fail here)
           sh '''
-            set -e
             echo "PWD=$(pwd)"
-            echo "Scanning for Dockerfiles..."
+            echo "Scanning for Dockerfiles (non-fatal)…"
             (find backend -maxdepth 2 -type f -name Dockerfile 2>/dev/null || true) | sed 's|^./||'
-            test -f frontend/Dockerfile && echo "frontend/Dockerfile"
+            if [ -f frontend/Dockerfile ]; then echo "frontend/Dockerfile"; fi
           '''
 
-          // Discover services: include root frontend + any backend/* with Dockerfile
+          // Build up list without using 'set -e' so missing files don't kill the stage
           def discovered = []
-          if (sh(script: "test -f frontend/Dockerfile && echo yes || echo no", returnStdout: true).trim() == "yes") {
-            discovered << "frontend"
-          }
+
+          // frontend (optional)
+          def hasFrontend = sh(script: '[ -f frontend/Dockerfile ] && echo yes || echo no', returnStdout: true).trim() == 'yes'
+          if (hasFrontend) discovered << 'frontend'
+
+          // backend services (required at least one)
           def back = sh(
             script: '''
-              set -e
               if [ -d backend ]; then
                 find backend -mindepth 1 -maxdepth 1 -type d | while read d; do
                   [ -f "$d/Dockerfile" ] && basename "$d"
@@ -40,12 +41,15 @@ pipeline {
             ''',
             returnStdout: true
           ).trim()
+
           if (back) {
-            discovered.addAll(back.split("\\n").collect{ it.trim() }.findAll{ it })
+            discovered.addAll(back.split("\\n").collect { it.trim() }.findAll { it })
           }
-          if (!discovered) {
-            error "No services found. Add Dockerfile(s) in frontend/ or backend/<service>/"
+
+          if (discovered.isEmpty()) {
+            error "No services found. Add Dockerfile(s) under frontend/ or backend/<service>/"
           }
+
           env.SERVICE_LIST = discovered.join(',')
           echo "Services to build (sequential): ${env.SERVICE_LIST}"
         }
@@ -78,67 +82,24 @@ pipeline {
     stage('Build & Push (sequential)') {
       steps {
         script {
-          // helpers
           def toRepo = { name ->
-            // frontend -> frontend; helloService -> hello-service; profileService -> profile-service
+            // frontend -> frontend ; helloService -> hello-service ; profileService -> profile-service
             name.replaceAll(/([a-z])([A-Z])/, '$1-$2').replaceAll(/[_\\s]+/, '-').toLowerCase()
           }
           def contextFor = { name -> name == 'frontend' ? 'frontend' : "backend/${name}" }
 
-          def services = env.SERVICE_LIST.split(',').collect{ it.trim() }.findAll{ it }
+          def services = env.SERVICE_LIST.split(',').collect { it.trim() }.findAll { it }
           services.each { svc ->
             stage("Service: ${svc}") {
               def repo = toRepo(svc)
               def ctx  = contextFor(svc)
               def df   = "${ctx}/Dockerfile"
 
-              // Ensure Dockerfile exists with correct case
+              // Ensure Dockerfile exists with exact case
               sh """
                 set -e
-                test -f "${df}" || { echo "ERROR: Missing ${df}. The file must be named exactly 'Dockerfile'."; exit 1; }
+                if [ ! -f "${df}" ]; then
+                  echo "ERROR: Missing ${df}. File must be named exactly 'Dockerfile'."
+                  exit 1
+                fi
               """
-
-              // Ensure ECR repo exists
-              sh """
-                set -e
-                aws ecr describe-repositories --repository-names "${repo}" >/dev/null 2>&1 || \
-                aws ecr create-repository --repository-name "${repo}" \
-                  --image-scanning-configuration scanOnPush=true \
-                  --encryption-configuration encryptionType=AES256
-              """
-
-              // Build
-              retry(2) {
-                sh """
-                  set -e
-                  echo "Building ${repo}:${IMAGE_TAG} from ${df} (context: ${ctx})"
-                  docker build -t "${repo}:${IMAGE_TAG}" -f "${df}" "${ctx}"
-                """
-              }
-
-              // Tag & push
-              retry(2) {
-                sh '''
-                  set -e
-                  ACCOUNT_ID=$(cat .account_id)
-                  REG="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-                  docker tag "${repo}:${IMAGE_TAG}" "${REG}/${repo}:${IMAGE_TAG}"
-                  docker tag "${repo}:${IMAGE_TAG}" "${REG}/${repo}:latest"
-                  docker push "${REG}/${repo}:${IMAGE_TAG}"
-                  docker push "${REG}/${repo}:latest"
-                '''
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  post {
-    always {
-      sh 'docker image prune -f || true'
-      sh 'rm -f .account_id || true'
-    }
-  }
-}
