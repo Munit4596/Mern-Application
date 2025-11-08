@@ -1,0 +1,93 @@
+pipeline {
+  agent any
+  options { timestamps() }
+
+  parameters {
+    choice(name: 'SERVICE', choices: ['frontend', 'helloService', 'ProfileService'], description: 'Which service to build & push?')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional tag (defaults to short git SHA)')
+    string(name: 'AWS_REGION', defaultValue: 'ca-central-1', description: 'AWS region')
+  }
+
+  environment {
+    AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+  }
+
+  stages {
+    stage('Compute vars') {
+      steps {
+        script {
+          // Map display name -> ECR repo (lowercase, kebab-case) and Dockerfile path
+          def svc = params.SERVICE
+          def map = [
+            'frontend':       [repo: 'frontend',          dockerfile: 'services/frontend/Dockerfile'],
+            'helloService':   [repo: 'hello-service',     dockerfile: 'services/backend/helloService/Dockerfile'],
+            'ProfileService': [repo: 'profile-service',   dockerfile: 'services/backend/ProfileService/Dockerfile']
+          ]
+          if (!map.containsKey(svc)) {
+            error "Unknown SERVICE: ${svc}"
+          }
+          env.ECR_REPO   = map[svc].repo
+          env.DOCKERFILE = map[svc].dockerfile
+
+          def sha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+          env.IMAGE_TAG = (params.IMAGE_TAG?.trim()) ? params.IMAGE_TAG.trim() : sha
+        }
+      }
+    }
+
+    stage('Resolve account & login to ECR') {
+      steps {
+        sh '''
+          set -e
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "$ACCOUNT_ID" > .account_id
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        '''
+      }
+    }
+
+    stage('Ensure ECR repo exists') {
+      steps {
+        sh '''
+          set -e
+          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+          aws ecr create-repository --repository-name "${ECR_REPO}" \
+             --image-scanning-configuration scanOnPush=true \
+             --encryption-configuration encryptionType=AES256
+        '''
+      }
+    }
+
+    stage('Docker build') {
+      steps {
+        sh '''
+          set -e
+          echo "Building ${ECR_REPO} using ${DOCKERFILE}"
+          docker build -f "${DOCKERFILE}" -t "${ECR_REPO}:${IMAGE_TAG}" .
+        '''
+      }
+    }
+
+    stage('Tag & push') {
+      steps {
+        sh '''
+          set -e
+          ACCOUNT_ID=$(cat .account_id)
+          REG="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REG}/${ECR_REPO}:${IMAGE_TAG}"
+          docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REG}/${ECR_REPO}:latest"
+          docker push "${REG}/${ECR_REPO}:${IMAGE_TAG}"
+          docker push "${REG}/${ECR_REPO}:latest"
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'docker image prune -f || true'
+      sh 'rm -f .account_id || true'
+    }
+  }
+}
