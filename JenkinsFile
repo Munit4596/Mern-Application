@@ -1,132 +1,123 @@
 pipeline {
   agent any
-  options { timestamps() }
-
-  parameters {
-    // SERVICE:
-    //  - "auto"  => discover all backend/* subfolders that contain a Dockerfile and build them in parallel
-    //  - "<name>" => build only backend/<name> (must contain Dockerfile)
-    string(name: 'SERVICE', defaultValue: 'auto', description: 'auto = build all backend/* services with a Dockerfile; or set a specific folder name (e.g., helloService)')
-    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional tag (defaults to short git SHA)')
-    string(name: 'AWS_REGION', defaultValue: 'ca-central-1', description: 'AWS region (default ca-central-1)')
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 30, unit: 'MINUTES')
   }
 
   environment {
-    AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+    AWS_DEFAULT_REGION = "ca-central-1"
   }
 
   stages {
-    stage('Sanity') {
+
+    stage('Sanity & Discover services') {
       steps {
-        sh '''
-          set -e
-          echo "PWD=$(pwd)"
-          echo "Listing backend structure (depth 2):"
-          find backend -maxdepth 2 -type f -name Dockerfile 2>/dev/null | sed 's|^./||' || true
-        '''
+        script {
+          // List Dockerfiles (for visibility)
+          sh '''
+            set -e
+            echo "PWD=$(pwd)"
+            echo "Scanning for Dockerfiles..."
+            (find backend -maxdepth 2 -type f -name Dockerfile 2>/dev/null || true) | sed 's|^./||'
+            test -f frontend/Dockerfile && echo "frontend/Dockerfile"
+          '''
+
+          // Discover services: include root frontend + any backend/* with Dockerfile
+          def discovered = []
+          if (sh(script: "test -f frontend/Dockerfile && echo yes || echo no", returnStdout: true).trim() == "yes") {
+            discovered << "frontend"
+          }
+          def back = sh(
+            script: '''
+              set -e
+              if [ -d backend ]; then
+                find backend -mindepth 1 -maxdepth 1 -type d | while read d; do
+                  [ -f "$d/Dockerfile" ] && basename "$d"
+                done
+              fi
+            ''',
+            returnStdout: true
+          ).trim()
+          if (back) {
+            discovered.addAll(back.split("\\n").collect{ it.trim() }.findAll{ it })
+          }
+          if (!discovered) {
+            error "No services found. Add Dockerfile(s) in frontend/ or backend/<service>/"
+          }
+          env.SERVICE_LIST = discovered.join(',')
+          echo "Services to build (sequential): ${env.SERVICE_LIST}"
+        }
       }
     }
 
     stage('Compute tag') {
       steps {
         script {
-          def sha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          env.IMAGE_TAG = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : sha
-        }
-      }
-    }
-
-    stage('Discover services') {
-      steps {
-        script {
-          if (params.SERVICE?.trim() && params.SERVICE.trim().toLowerCase() != 'auto') {
-            // build only the requested service
-            env.SERVICE_LIST = params.SERVICE.trim()
-            // verify Dockerfile exists
-            sh """
-              set -e
-              test -f "backend/${params.SERVICE.trim()}/Dockerfile" || { echo "ERROR: backend/${params.SERVICE.trim()}/Dockerfile not found."; exit 1; }
-            """
-          } else {
-            // auto-discover all services that contain a Dockerfile
-            def out = sh(
-              script: '''
-                set -e
-                if [ -d backend ]; then
-                  find backend -mindepth 1 -maxdepth 1 -type d | while read d; do
-                    [ -f "$d/Dockerfile" ] && basename "$d"
-                  done
-                fi
-              ''',
-              returnStdout: true
-            ).trim()
-
-            if (!out) {
-              error "No services found. Place Dockerfile(s) under backend/<service>/Dockerfile."
-            }
-            env.SERVICE_LIST = out.split("\\n").collect { it.trim() }.findAll { it }.join(',')
-          }
-
-          echo "Services to build: ${env.SERVICE_LIST}"
+          env.IMAGE_TAG = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+          echo "IMAGE_TAG=${env.IMAGE_TAG}"
         }
       }
     }
 
     stage('AWS login (ECR)') {
       steps {
-        sh '''
-          set -e
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "$ACCOUNT_ID" > .account_id
-          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-        '''
+        retry(2) {
+          sh '''
+            set -e
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            echo "$ACCOUNT_ID" > .account_id
+            aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+              | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          '''
+        }
       }
     }
 
-    stage('Build & Push') {
+    stage('Build & Push (sequential)') {
       steps {
         script {
-          // helper to convert service folder to ECR repo (lowercase-kebab)
-          def toRepo = { svc ->
-            return svc.replaceAll(/([a-z])([A-Z])/, '$1-$2')
-                      .replaceAll(/[_\\s]+/, '-')
-                      .toLowerCase()
+          // helpers
+          def toRepo = { name ->
+            // frontend -> frontend; helloService -> hello-service; profileService -> profile-service
+            name.replaceAll(/([a-z])([A-Z])/, '$1-$2').replaceAll(/[_\\s]+/, '-').toLowerCase()
           }
+          def contextFor = { name -> name == 'frontend' ? 'frontend' : "backend/${name}" }
 
-          def services = env.SERVICE_LIST.split(',').collect { it.trim() }.findAll { it }
-          def branches = [:]
-
+          def services = env.SERVICE_LIST.split(',').collect{ it.trim() }.findAll{ it }
           services.each { svc ->
-            branches[svc] = {
-              stage("Service: ${svc}") {
-                def repo = toRepo(svc)                    // ECR repo name
-                def contextDir = "backend/${svc}"         // build context
-                def dockerfile = "${contextDir}/Dockerfile"
+            stage("Service: ${svc}") {
+              def repo = toRepo(svc)
+              def ctx  = contextFor(svc)
+              def df   = "${ctx}/Dockerfile"
 
-                // Ensure Dockerfile exists with correct case
+              // Ensure Dockerfile exists with correct case
+              sh """
+                set -e
+                test -f "${df}" || { echo "ERROR: Missing ${df}. The file must be named exactly 'Dockerfile'."; exit 1; }
+              """
+
+              // Ensure ECR repo exists
+              sh """
+                set -e
+                aws ecr describe-repositories --repository-names "${repo}" >/dev/null 2>&1 || \
+                aws ecr create-repository --repository-name "${repo}" \
+                  --image-scanning-configuration scanOnPush=true \
+                  --encryption-configuration encryptionType=AES256
+              """
+
+              // Build
+              retry(2) {
                 sh """
                   set -e
-                  test -f "${dockerfile}" || { echo "ERROR: Missing ${dockerfile}. Ensure file name is exactly 'Dockerfile'."; exit 1; }
+                  echo "Building ${repo}:${IMAGE_TAG} from ${df} (context: ${ctx})"
+                  docker build -t "${repo}:${IMAGE_TAG}" -f "${df}" "${ctx}"
                 """
+              }
 
-                // Ensure ECR repo exists
-                sh """
-                  set -e
-                  aws ecr describe-repositories --repository-names "${repo}" >/dev/null 2>&1 || \
-                  aws ecr create-repository --repository-name "${repo}" \
-                    --image-scanning-configuration scanOnPush=true \
-                    --encryption-configuration encryptionType=AES256
-                """
-
-                // Build
-                sh """
-                  set -e
-                  echo "Building ${repo}:${IMAGE_TAG} from ${dockerfile} (context: ${contextDir})"
-                  docker build -t "${repo}:${IMAGE_TAG}" -f "${dockerfile}" "${contextDir}"
-                """
-
-                // Tag & push
+              // Tag & push
+              retry(2) {
                 sh '''
                   set -e
                   ACCOUNT_ID=$(cat .account_id)
@@ -138,13 +129,6 @@ pipeline {
                 '''
               }
             }
-          }
-
-          // Build in parallel if multiple services
-          if (branches.size() == 1) {
-            branches.values().first().call()
-          } else {
-            parallel branches
           }
         }
       }
