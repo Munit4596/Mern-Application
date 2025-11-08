@@ -3,9 +3,12 @@ pipeline {
   options { timestamps() }
 
   parameters {
-    choice(name: 'SERVICE', choices: ['frontend', 'helloService', 'ProfileService'], description: 'Which service to build & push?')
+    // SERVICE:
+    //  - "auto"  => discover all backend/* subfolders that contain a Dockerfile and build them in parallel
+    //  - "<name>" => build only backend/<name> (must contain Dockerfile)
+    string(name: 'SERVICE', defaultValue: 'auto', description: 'auto = build all backend/* services with a Dockerfile; or set a specific folder name (e.g., helloService)')
     string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional tag (defaults to short git SHA)')
-    string(name: 'AWS_REGION', defaultValue: 'ca-central-1', description: 'AWS region')
+    string(name: 'AWS_REGION', defaultValue: 'ca-central-1', description: 'AWS region (default ca-central-1)')
   }
 
   environment {
@@ -13,25 +16,63 @@ pipeline {
   }
 
   stages {
-    stage('Compute vars') {
+    stage('Sanity') {
+      steps {
+        sh '''
+          set -e
+          echo "PWD=$(pwd)"
+          echo "Listing backend structure (depth 2):"
+          find backend -maxdepth 2 -type f -name Dockerfile 2>/dev/null | sed 's|^./||' || true
+        '''
+      }
+    }
+
+    stage('Compute tag') {
       steps {
         script {
-          // map service → ECR repo (lowercase/kebab) + Dockerfile path in YOUR repo
-          def map = [
-            'frontend':       [repo: 'frontend',        dockerfile: 'frontend/Dockerfile'],
-            'helloService':   [repo: 'hello-service',   dockerfile: 'backend/helloService/Dockerfile'],
-            'ProfileService': [repo: 'profile-service', dockerfile: 'backend/ProfileService/Dockerfile']
-          ]
-          env.ECR_REPO   = map[params.SERVICE].repo
-          env.DOCKERFILE = map[params.SERVICE].dockerfile
-
           def sha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          env.IMAGE_TAG = (params.IMAGE_TAG?.trim()) ? params.IMAGE_TAG.trim() : sha
+          env.IMAGE_TAG = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : sha
         }
       }
     }
 
-    stage('Resolve account & login to ECR') {
+    stage('Discover services') {
+      steps {
+        script {
+          if (params.SERVICE?.trim() && params.SERVICE.trim().toLowerCase() != 'auto') {
+            // build only the requested service
+            env.SERVICE_LIST = params.SERVICE.trim()
+            // verify Dockerfile exists
+            sh """
+              set -e
+              test -f "backend/${params.SERVICE.trim()}/Dockerfile" || { echo "ERROR: backend/${params.SERVICE.trim()}/Dockerfile not found."; exit 1; }
+            """
+          } else {
+            // auto-discover all services that contain a Dockerfile
+            def out = sh(
+              script: '''
+                set -e
+                if [ -d backend ]; then
+                  find backend -mindepth 1 -maxdepth 1 -type d | while read d; do
+                    [ -f "$d/Dockerfile" ] && basename "$d"
+                  done
+                fi
+              ''',
+              returnStdout: true
+            ).trim()
+
+            if (!out) {
+              error "No services found. Place Dockerfile(s) under backend/<service>/Dockerfile."
+            }
+            env.SERVICE_LIST = out.split("\\n").collect { it.trim() }.findAll { it }.join(',')
+          }
+
+          echo "Services to build: ${env.SERVICE_LIST}"
+        }
+      }
+    }
+
+    stage('AWS login (ECR)') {
       steps {
         sh '''
           set -e
@@ -43,39 +84,69 @@ pipeline {
       }
     }
 
-    stage('Ensure ECR repo exists') {
+    stage('Build & Push') {
       steps {
-        sh '''
-          set -e
-          aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-          aws ecr create-repository --repository-name "${ECR_REPO}" \
-             --image-scanning-configuration scanOnPush=true \
-             --encryption-configuration encryptionType=AES256
-        '''
-      }
-    }
+        script {
+          // helper to convert service folder to ECR repo (lowercase-kebab)
+          def toRepo = { svc ->
+            return svc.replaceAll(/([a-z])([A-Z])/, '$1-$2')
+                      .replaceAll(/[_\\s]+/, '-')
+                      .toLowerCase()
+          }
 
-    stage('Docker build') {
-      steps {
-        sh '''
-          set -e
-          echo "Building ${ECR_REPO} using ${DOCKERFILE}"
-          docker build -f "${DOCKERFILE}" -t "${ECR_REPO}:${IMAGE_TAG}" .
-        '''
-      }
-    }
+          def services = env.SERVICE_LIST.split(',').collect { it.trim() }.findAll { it }
+          def branches = [:]
 
-    stage('Tag & push') {
-      steps {
-        sh '''
-          set -e
-          ACCOUNT_ID=$(cat .account_id)
-          REG="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-          docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REG}/${ECR_REPO}:${IMAGE_TAG}"
-          docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REG}/${ECR_REPO}:latest"
-          docker push "${REG}/${ECR_REPO}:${IMAGE_TAG}"
-          docker push "${REG}/${ECR_REPO}:latest"
-        '''
+          services.each { svc ->
+            branches[svc] = {
+              stage("Service: ${svc}") {
+                def repo = toRepo(svc)                    // ECR repo name
+                def contextDir = "backend/${svc}"         // build context
+                def dockerfile = "${contextDir}/Dockerfile"
+
+                // Ensure Dockerfile exists with correct case
+                sh """
+                  set -e
+                  test -f "${dockerfile}" || { echo "ERROR: Missing ${dockerfile}. Ensure file name is exactly 'Dockerfile'."; exit 1; }
+                """
+
+                // Ensure ECR repo exists
+                sh """
+                  set -e
+                  aws ecr describe-repositories --repository-names "${repo}" >/dev/null 2>&1 || \
+                  aws ecr create-repository --repository-name "${repo}" \
+                    --image-scanning-configuration scanOnPush=true \
+                    --encryption-configuration encryptionType=AES256
+                """
+
+                // Build
+                sh """
+                  set -e
+                  echo "Building ${repo}:${IMAGE_TAG} from ${dockerfile} (context: ${contextDir})"
+                  docker build -t "${repo}:${IMAGE_TAG}" -f "${dockerfile}" "${contextDir}"
+                """
+
+                // Tag & push
+                sh '''
+                  set -e
+                  ACCOUNT_ID=$(cat .account_id)
+                  REG="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+                  docker tag "${repo}:${IMAGE_TAG}" "${REG}/${repo}:${IMAGE_TAG}"
+                  docker tag "${repo}:${IMAGE_TAG}" "${REG}/${repo}:latest"
+                  docker push "${REG}/${repo}:${IMAGE_TAG}"
+                  docker push "${REG}/${repo}:latest"
+                '''
+              }
+            }
+          }
+
+          // Build in parallel if multiple services
+          if (branches.size() == 1) {
+            branches.values().first().call()
+          } else {
+            parallel branches
+          }
+        }
       }
     }
   }
