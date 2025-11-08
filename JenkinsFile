@@ -16,18 +16,14 @@ pipeline {
     stage('Compute vars') {
       steps {
         script {
-          // Map display name -> ECR repo (lowercase, kebab-case) and Dockerfile path
-          def svc = params.SERVICE
+          // map service → ECR repo (lowercase/kebab) + Dockerfile path in YOUR repo
           def map = [
-            'frontend':       [repo: 'frontend',          dockerfile: 'services/frontend/Dockerfile'],
-            'helloService':   [repo: 'hello-service',     dockerfile: 'services/backend/helloService/Dockerfile'],
-            'ProfileService': [repo: 'profile-service',   dockerfile: 'services/backend/ProfileService/Dockerfile']
+            'frontend':       [repo: 'frontend',        dockerfile: 'frontend/Dockerfile'],
+            'helloService':   [repo: 'hello-service',   dockerfile: 'backend/helloService/Dockerfile'],
+            'ProfileService': [repo: 'profile-service', dockerfile: 'backend/ProfileService/Dockerfile']
           ]
-          if (!map.containsKey(svc)) {
-            error "Unknown SERVICE: ${svc}"
-          }
-          env.ECR_REPO   = map[svc].repo
-          env.DOCKERFILE = map[svc].dockerfile
+          env.ECR_REPO   = map[params.SERVICE].repo
+          env.DOCKERFILE = map[params.SERVICE].dockerfile
 
           def sha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
           env.IMAGE_TAG = (params.IMAGE_TAG?.trim()) ? params.IMAGE_TAG.trim() : sha
